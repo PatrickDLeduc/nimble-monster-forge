@@ -1,0 +1,19 @@
+Name,Level,HP,Armor Type,Speed,Fly Speed,Burrow Speed,Size,Damage Per Round,Attack Description,Save DC,Special Abilities,Monster Family,Environment Tags,Is Legendary,Source
+Kobold Minion,0.25,12,None,6,,,Small,3,"Stab. 1d4 (follows minion rules)",9,"Nooooo! When an ally within 2 spaces dies, attack once for free.",Kobold,"underground,dungeon",FALSE,GMG Official
+Kobold,0.33,15,None,6,,,Small,5,"Stab. 1d4+2 (or Sling, Range 8)",9,"Nooooo! When an ally within 2 spaces dies, attack once for free.",Kobold,"underground,dungeon",FALSE,GMG Official
+Kobold Sneak,0.5,18,None,6,,,Small,7,"Stab. 1d4+2 (or Sling, Range 8)",10,"Revenge! When an ally dies, move up to 6 spaces before Nooooo! ability.",Kobold,"underground,dungeon",FALSE,GMG Official
+Goblin Minion,0.25,12,None,6,,,Small,3,"Stab. 1d6 (follows minion rules)",9,"Haha, Missed Me! Whenever an attack misses you, deal 1 psychic damage in return.",Goblin,"forest,hill",FALSE,GMG Official
+Goblin,0.33,15,None,6,,,Small,5,"Stab. 1d6+2 (or Shoot, Range 8)",9,"Haha, Missed Me! Whenever an attack misses you, deal 1 psychic damage in return.",Goblin,"forest,hill",FALSE,GMG Official
+Bugbear,2,30,Medium,6,,,Medium,13,"Cleave. 2d6+4. OR Javelin. 1d6+2 (Range 8)",11,"Haha, Missed Me! Whenever an attack misses you, deal 1 psychic damage in return.",Goblin,"forest,hill",FALSE,GMG Official
+Goblin Ratrider,2,30,None,10,,,Medium,13,"Bite & Stab (2x). 1d6+2. On Move: Overrun. Rat dashes through enemies dealing 1d4.",11,"Haha, Missed Me! Mount rules apply.",Goblin,"forest,hill",FALSE,GMG Official
+Skeleton Minion,0.25,9,Medium,6,,,Medium,3,"Slash. 1d6 (follows minion rules)",9,"Reassemble. On death, 50% chance to return with 1 HP at start of next round.",Undead,"dungeon,shadowblight",FALSE,GMG Official
+Skeleton,0.5,15,Medium,6,,,Medium,7,"Slash. 1d6+3 (or Shortbow, Range 8)",10,"Reassemble. On death, 50% chance to return with 1 HP at start of next round.",Undead,"dungeon,shadowblight",FALSE,GMG Official
+Zombie,0.5,18,None,4,,,Medium,7,"Slam. 1d8+3",10,"Undying. First time reduced to 0 HP, drop to 1 HP instead.",Undead,"dungeon,shadowblight",FALSE,GMG Official
+Ghoul,2,34,None,6,,,Medium,13,"Claws (2x). 1d6+4. On hit: DC 11 or Paralyzed (save ends).",11,"Paralytic Touch. Melee attacks force DC 11 save or Paralyzed.",Undead,"dungeon,shadowblight",FALSE,GMG Official
+Bandit,0.5,15,Medium,6,,,Medium,7,"Shortsword. 1d6+3 (or Shortbow, Range 8)",10,"Pack Tactics. Advantage on attacks if an ally is within 2 spaces of target.",Bandit,"road,forest",FALSE,GMG Official
+Bandit Captain,2,27,Medium,6,,,Medium,13,"Longsword (2x). 1d8+4. OR Rally. One ally attacks for free.",11,"Commanding Presence. Once per round, give one ally a free attack.",Bandit,"road,forest",FALSE,GMG Official
+Wolf,0.5,18,None,8,,,Medium,7,"Bite. 1d8+3. On hit: DC 10 or knocked Prone.",10,"Pack Tactics. Advantage on attacks if an ally is within 2 spaces of target.",Beast,"forest,hill",FALSE,GMG Official
+Dire Wolf,2,34,None,8,,,Large,13,"Bite. 2d6+4. On hit: DC 11 or knocked Prone.",11,"Pack Tactics. Knockdown bite.",Beast,"forest,hill",FALSE,GMG Official
+Giant Eagle,3,33,None,6,10,,Large,15,"Talons. 1d12+5 (ignores metal armor). On Death: Deal 1d12 damage back.",11,"Flyby. No opportunity attacks when flying away.",Beast,"hill,sky",FALSE,GMG Official
+Cultist,1,28,None,6,,,Medium,11,"Oblation of Blood! OR Dreadful Blade. 1d6+6. OR Blood Boil. (Range 12, Bloodied creature) 3d6+6.",10,"Fanatical Zeal. While not at max HP, make all rolls with advantage. Crits also inflict Despair.",Cultist,shadowblight,FALSE,GMG Official
+Spiny Fiend,4,49,None,6,,,Medium,18,"Claws (2x). 1d6+6. OR Shoot Spine. (Range 12) 1d6+6.",12,"Spines. Melee attackers take 3 damage. Fanatical Zeal.",Cultist,shadowblight,FALSE,GMG Official

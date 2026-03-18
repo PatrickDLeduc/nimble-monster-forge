@@ -9,9 +9,65 @@ import json
 import http.server
 import urllib.request
 import urllib.error
-
 import os
+import threading
+
 PORT = int(os.environ.get("PORT", 8000))
+
+# ── Invite Code Auth ──────────────────────────────────────────────
+# Environment variables (set these on Render.com):
+#   ANTHROPIC_API_KEY  — your sk-ant-... key
+#   INVITE_CODES       — comma-separated, e.g. "dragon:50,phoenix:50,friends:200"
+#   DEFAULT_USAGE_CAP  — default max uses per code (default: 50)
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+DEFAULT_CAP = int(os.environ.get("DEFAULT_USAGE_CAP", "50"))
+
+# Parse invite codes: "code1:cap,code2:cap,code3" (no cap = default)
+_raw_codes = os.environ.get("INVITE_CODES", "")
+INVITE_CODES = {}  # {code_lower: max_uses}
+for _entry in _raw_codes.split(","):
+    _entry = _entry.strip()
+    if not _entry:
+        continue
+    if ":" in _entry:
+        _code, _cap = _entry.rsplit(":", 1)
+        INVITE_CODES[_code.strip().lower()] = int(_cap.strip())
+    else:
+        INVITE_CODES[_entry.lower()] = DEFAULT_CAP
+
+# In-memory usage tracking {code_lower: count}
+_usage = {}
+_usage_lock = threading.Lock()
+
+
+def validate_code(code):
+    """Returns (ok, message, remaining)"""
+    if not code:
+        return False, "No invite code provided.", None
+    c = code.strip().lower()
+    if c not in INVITE_CODES:
+        return False, "Invalid invite code.", None
+    cap = INVITE_CODES[c]
+    with _usage_lock:
+        used = _usage.get(c, 0)
+    remaining = cap - used
+    if remaining <= 0:
+        return False, f"This code has reached its limit ({cap} uses).", 0
+    return True, "Valid", remaining
+
+
+def consume_code(code):
+    """Deduct one use. Call after successful API call."""
+    c = code.strip().lower()
+    cap = INVITE_CODES.get(c, 0)
+    with _usage_lock:
+        used = _usage.get(c, 0)
+        if used >= cap:
+            return False, 0
+        _usage[c] = used + 1
+        return True, cap - (used + 1)
+# ── End Auth ──────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -109,12 +165,12 @@ RULES:
 JSON SCHEMA (respond with EXACTLY this structure):
 {"name":"","level":0,"hp":0,"armor":"None","speed":6,"fly":null,"burrow":null,"size":"Medium","dpr":0,"save_dc":0,"attacks":"Attack1. dice+mod. Effect. | Attack2. dice+mod.","trait":"Trait Name. Description.","abilities":"Ability1. Description. | Ability2. Description.","legendary":false,"bloodied":"","last_stand":"","last_stand_hp":null,"saves":"","lore":"","tips":"","encounter":"","balance":"","tags":"tag1, tag2","family":""}`;
 
-let state={heroes:[{name:"",cls:"Berserker",level:3}],theme:[],env:[],diff:"Hard",legendary:false,custom:"",size:"",loading:false,error:null,monster:null,showExport:null,showConfig:false,cfg:JSON.parse(localStorage.getItem("nimble_cfg")||'{"anthropicKey":"","atToken":"","atBase":"","atTable":""}'),atStatus:null,atError:null,atWarnings:null};
+let state={heroes:[{name:"",cls:"Berserker",level:3}],theme:[],env:[],diff:"Hard",legendary:false,custom:"",size:"",loading:false,error:null,monster:null,showExport:null,showConfig:false,cfg:JSON.parse(localStorage.getItem("nimble_cfg")||'{"inviteCode":"","atToken":"","atBase":"","atTable":""}'),atStatus:null,atError:null,atWarnings:null,codeStatus:null};
 
 function saveCfg(){localStorage.setItem("nimble_cfg",JSON.stringify(state.cfg))}
 function totalLvl(){return state.heroes.reduce((s,h)=>s+(parseInt(h.level)||1),0)}
 function avgLvl(){return Math.round(totalLvl()/state.heroes.length)}
-function hasCfg(){return !!state.cfg.anthropicKey}
+function hasCfg(){return !!state.cfg.inviteCode}
 function hasAt(){return state.cfg.atToken&&state.cfg.atBase&&state.cfg.atTable}
 
 function parseResponse(text){
@@ -147,16 +203,17 @@ function toFields(m){
 
 async function generate(){
   state.loading=true;state.error=null;state.monster=null;state.atStatus=null;state.atWarnings=null;state.showExport=null;render();
-  if(!state.cfg.anthropicKey){state.loading=false;state.error="Set your Anthropic API key in Settings first.";state.showConfig=true;render();return}
+  if(!state.cfg.inviteCode){state.loading=false;state.error="Enter your invite code in Settings first.";state.showConfig=true;render();return}
   const party=state.heroes.map((h,i)=>`${h.name||"Hero "+(i+1)}: Level ${h.level} ${h.cls}`).join(", ");
   const prompt=`Create a ${state.legendary?"LEGENDARY ":""}monster for: ${party} (${state.heroes.length} heroes, total levels ${totalLvl()}). Difficulty: ${state.diff}. Theme: ${state.theme.join(", ")||"any"}. Environment: ${state.env.join(", ")||"any"}. ${state.size?"Size: "+state.size+".":""} ${state.legendary?"Use Legendary table at party level "+avgLvl()+".":""} ${state.custom}`;
   try{
     const res=await fetch("/api/claude",{
       method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({key:state.cfg.anthropicKey,system:SYSTEM_PROMPT,prompt:prompt})
+      body:JSON.stringify({code:state.cfg.inviteCode,system:SYSTEM_PROMPT,prompt:prompt})
     });
     const data=await res.json();
     if(data.error)throw new Error(data.error);
+    if(data.remaining!==undefined)state.codeStatus={ok:true,remaining:data.remaining};
     state.monster=parseResponse(data.text);
   }catch(e){state.error=e.message}
   state.loading=false;render();
@@ -180,6 +237,18 @@ async function saveToAirtable(){
   render();
 }
 
+async function validateCode(){
+  const code=state.cfg.inviteCode;
+  if(!code){state.codeStatus=null;render();return}
+  try{
+    const res=await fetch("/api/validate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:code})});
+    const data=await res.json();
+    if(data.ok){state.codeStatus={ok:true,remaining:data.remaining}}
+    else{state.codeStatus={ok:false,error:data.error}}
+  }catch(e){state.codeStatus={ok:false,error:"Could not reach server."}}
+  render();
+}
+
 function esc(s){return(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
 
 function render(){
@@ -191,17 +260,19 @@ function render(){
     <button class="btn-cfg ${hasCfg()?'on':''}" onclick="state.showConfig=!state.showConfig;render()">${hasCfg()?"● Settings":"⚙ Settings"}</button></div>
     <p class="sub">AI-powered creature design for Nimble RPG</p>`;
 
-  if(state.showConfig){const c=state.cfg;
-    h+=`<div class="config-panel"><span class="gold" style="font-family:Cinzel,serif;font-size:14px;font-weight:bold;letter-spacing:1px">API SETTINGS</span>
-    <div style="margin-top:16px;margin-bottom:12px"><label class="section">Anthropic API Key</label>
-    <input type="password" id="cfgA" value="${esc(c.anthropicKey)}" placeholder="sk-ant-..."><div class="hint">console.anthropic.com/settings/keys</div></div>
+  if(state.showConfig){const c=state.cfg;const cs=state.codeStatus;
+    h+=`<div class="config-panel"><span class="gold" style="font-family:Cinzel,serif;font-size:14px;font-weight:bold;letter-spacing:1px">SETTINGS</span>
+    <div style="margin-top:16px;margin-bottom:12px"><label class="section">Invite Code</label>
+    <input id="cfgCode" value="${esc(c.inviteCode||'')}" placeholder="Enter your invite code"><div class="hint">Get a code from the forge master</div>`;
+    if(cs){if(cs.ok){h+=`<div style="color:#6cb86c;font-size:12px;margin-top:4px">✓ Valid — ${cs.remaining} forges remaining</div>`}else{h+=`<div style="color:#e88;font-size:12px;margin-top:4px">✗ ${esc(cs.error||'Invalid')}</div>`}}
+    h+=`</div>
     <div style="margin-bottom:12px"><label class="section">Airtable Token</label>
     <input type="password" id="cfgT" value="${esc(c.atToken)}" placeholder="pat..."><div class="hint">airtable.com/create/tokens — needs data.records:write</div></div>
     <div style="margin-bottom:12px"><label class="section">Airtable Base ID</label>
     <input id="cfgB" value="${esc(c.atBase)}" placeholder="appXXXXXXXXXXXXXX"></div>
     <div style="margin-bottom:16px"><label class="section">Airtable Monsters Table ID</label>
     <input id="cfgTbl" value="${esc(c.atTable)}" placeholder="tblXXXXXXXXXXXXXX"><div class="hint">Both IDs from your URL: airtable.com/appXXX/tblXXX/...</div></div>
-    <div style="display:flex;gap:8px"><button class="btn-save-cfg" onclick="state.cfg={anthropicKey:document.getElementById('cfgA').value,atToken:document.getElementById('cfgT').value,atBase:document.getElementById('cfgB').value,atTable:document.getElementById('cfgTbl').value};saveCfg();state.showConfig=false;render()">Save</button>
+    <div style="display:flex;gap:8px"><button class="btn-save-cfg" onclick="state.cfg={inviteCode:document.getElementById('cfgCode').value,atToken:document.getElementById('cfgT').value,atBase:document.getElementById('cfgB').value,atTable:document.getElementById('cfgTbl').value};saveCfg();validateCode();state.showConfig=false;render()">Save</button>
     <button class="btn-cancel" onclick="state.showConfig=false;render()">Cancel</button></div></div>`}
 
   h+=`<div class="group"><div style="display:flex;justify-content:space-between;margin-bottom:8px">
@@ -272,6 +343,7 @@ window.setDiff=v=>{state.diff=v;render()};
 window.toggleTheme=v=>{state.theme=state.theme.includes(v)?state.theme.filter(x=>x!==v):[...state.theme,v];render()};
 window.toggleEnv=v=>{state.env=state.env.includes(v)?state.env.filter(x=>x!==v):[...state.env,v];render()};
 render();
+validateCode();
 </script>
 </body></html>"""
 
@@ -290,10 +362,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._proxy_claude(body)
         elif self.path == "/api/airtable":
             self._proxy_airtable(body)
+        elif self.path == "/api/validate":
+            self._validate_code(body)
         else:
             self._json_response(404, {"error": "Not found"})
 
+    def _validate_code(self, body):
+        code = body.get("code", "")
+        ok, msg, remaining = validate_code(code)
+        if ok:
+            self._json_response(200, {"ok": True, "remaining": remaining})
+        else:
+            self._json_response(403, {"ok": False, "error": msg, "remaining": remaining})
+
     def _proxy_claude(self, body):
+        # Validate invite code first
+        code = body.get("code", "")
+        ok, msg, remaining = validate_code(code)
+        if not ok:
+            self._json_response(403, {"error": msg})
+            return
+        if not ANTHROPIC_API_KEY:
+            self._json_response(500, {"error": "Server API key not configured. Ask the forge master."})
+            return
+
         try:
             payload = json.dumps({
                 "model": "claude-sonnet-4-20250514",
@@ -306,14 +398,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data=payload,
                 headers={
                     "Content-Type": "application/json",
-                    "x-api-key": body.get("key", ""),
+                    "x-api-key": ANTHROPIC_API_KEY,
                     "anthropic-version": "2023-06-01"
                 }
             )
             with urllib.request.urlopen(req) as res:
                 data = json.loads(res.read())
                 text = "".join(b.get("text", "") for b in data.get("content", []))
-                self._json_response(200, {"text": text})
+                # Deduct usage after successful call
+                ok_consume, new_remaining = consume_code(code)
+                self._json_response(200, {"text": text, "remaining": new_remaining})
         except urllib.error.HTTPError as e:
             err = e.read().decode()
             try:
@@ -410,12 +504,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"  {msg}")
 
 if __name__ == "__main__":
+    auth_lines = []
+    if ANTHROPIC_API_KEY:
+        auth_lines.append("  ✓ API key loaded")
+    else:
+        auth_lines.append("  ⚠ ANTHROPIC_API_KEY not set!")
+    if INVITE_CODES:
+        auth_lines.append(f"  ✓ {len(INVITE_CODES)} invite code(s) active")
+        for c, cap in INVITE_CODES.items():
+            masked = c[:3] + "•" * max(0, len(c) - 3)
+            auth_lines.append(f"      {masked} (limit: {cap})")
+    else:
+        auth_lines.append("  ⚠ INVITE_CODES not set — no one can forge!")
+    auth_block = "\n".join(auth_lines)
+
     print(f"""
 ╔══════════════════════════════════════════╗
 ║       ⚔  NIMBLE MONSTER FORGE  ⚔        ║
 ║                                          ║
 ║  Open: http://localhost:{PORT}              ║
 ║  Stop: Ctrl+C                            ║
+╠══════════════════════════════════════════╣
+{auth_block}
 ╚══════════════════════════════════════════╝
 """)
     server = http.server.HTTPServer(("", PORT), Handler)

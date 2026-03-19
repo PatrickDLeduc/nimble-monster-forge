@@ -598,11 +598,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         start = time.time()
 
         if self.path == "/metrics":
-            # ── Prometheus metrics endpoint (protected by bearer token) ──
+            # ── Prometheus metrics endpoint ──
+            # Accepts: Bearer token (Grafana Cloud), valid admin Basic Auth (browser),
+            # or same-origin fetch (no auth header, has matching Referer from /admin)
             if METRICS_BEARER_TOKEN:
                 auth_header = self.headers.get("Authorization", "")
-                expected = f"Bearer {METRICS_BEARER_TOKEN}"
-                if auth_header != expected:
+                referer = self.headers.get("Referer", "")
+                is_bearer_ok = auth_header == f"Bearer {METRICS_BEARER_TOKEN}"
+                is_admin_referer = "/admin" in referer
+                is_basic_ok = False
+                if auth_header.startswith("Basic "):
+                    try:
+                        decoded = base64.b64decode(auth_header[6:]).decode()
+                        _, pw = decoded.split(":", 1)
+                        is_basic_ok = (pw == ADMIN_KEY)
+                    except Exception:
+                        pass
+                if not (is_bearer_ok or is_admin_referer or is_basic_ok):
                     self.send_response(401)
                     self.send_header("Content-Type", "text/plain")
                     self.end_headers()

@@ -11,6 +11,7 @@ import urllib.request
 import urllib.error
 import os
 import threading
+import time
 
 PORT = int(os.environ.get("PORT", 8000))
 
@@ -19,9 +20,15 @@ PORT = int(os.environ.get("PORT", 8000))
 #   ANTHROPIC_API_KEY  — your sk-ant-... key
 #   INVITE_CODES       — comma-separated, e.g. "dragon:50,phoenix:50,friends:200"
 #   DEFAULT_USAGE_CAP  — default max uses per code (default: 50)
+#   ALLOWED_ORIGIN     — your Render URL, e.g. "https://nimble-monster-forge.onrender.com"
+#   ADMIN_KEY          — secret key to access /api/status, e.g. "mysecretkey123"
+#   RATE_LIMIT_SEC     — seconds between forges per code (default: 10)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DEFAULT_CAP = int(os.environ.get("DEFAULT_USAGE_CAP", "50"))
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")  # "*" for local dev
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+RATE_LIMIT_SEC = int(os.environ.get("RATE_LIMIT_SEC", "10"))
 
 # Parse invite codes: "code1:cap,code2:cap,code3" (no cap = default)
 _raw_codes = os.environ.get("INVITE_CODES", "")
@@ -67,6 +74,45 @@ def consume_code(code):
             return False, 0
         _usage[c] = used + 1
         return True, cap - (used + 1)
+
+
+# Rate limiter: {code_lower: last_forge_timestamp}
+_last_forge = {}
+
+
+def check_rate_limit(code):
+    """Returns (ok, seconds_to_wait)"""
+    c = code.strip().lower()
+    now = time.time()
+    with _usage_lock:
+        last = _last_forge.get(c, 0)
+        elapsed = now - last
+        if elapsed < RATE_LIMIT_SEC:
+            return False, round(RATE_LIMIT_SEC - elapsed)
+        return True, 0
+
+
+def record_forge_time(code):
+    """Record that a forge just happened for rate limiting."""
+    c = code.strip().lower()
+    with _usage_lock:
+        _last_forge[c] = time.time()
+
+
+def get_all_status():
+    """Return usage stats for all codes (for admin endpoint)."""
+    with _usage_lock:
+        return {
+            code: {
+                "used": _usage.get(code, 0),
+                "cap": cap,
+                "remaining": cap - _usage.get(code, 0),
+                "last_forge": round(_last_forge.get(code, 0))
+            }
+            for code, cap in INVITE_CODES.items()
+        }
+
+_server_start = time.time()
 # ── End Auth ──────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
@@ -348,11 +394,23 @@ validateCode();
 </body></html>"""
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
-        self.wfile.write(HTML.encode())
+
+    def do_GET(self):
+        if self.path.startswith("/api/status"):
+            self._admin_status()
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(HTML.encode())
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -375,6 +433,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self._json_response(403, {"ok": False, "error": msg, "remaining": remaining})
 
+    def _admin_status(self):
+        """GET /api/status?key=ADMIN_KEY — check usage from your phone."""
+        from urllib.parse import urlparse, parse_qs
+        query = parse_qs(urlparse(self.path).query)
+        key = query.get("key", [""])[0]
+        if not ADMIN_KEY or key != ADMIN_KEY:
+            self._json_response(403, {"error": "Invalid or missing admin key."})
+            return
+        self._json_response(200, {
+            "codes": get_all_status(),
+            "server_uptime_sec": round(time.time() - _server_start),
+            "api_key_set": bool(ANTHROPIC_API_KEY)
+        })
+
     def _proxy_claude(self, body):
         # Validate invite code first
         code = body.get("code", "")
@@ -384,6 +456,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if not ANTHROPIC_API_KEY:
             self._json_response(500, {"error": "Server API key not configured. Ask the forge master."})
+            return
+
+        # Rate limit check
+        rate_ok, wait_sec = check_rate_limit(code)
+        if not rate_ok:
+            self._json_response(429, {"error": f"Slow down — wait {wait_sec} more second{'s' if wait_sec != 1 else ''}.", "retry_after": wait_sec})
             return
 
         try:
@@ -407,6 +485,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 text = "".join(b.get("text", "") for b in data.get("content", []))
                 # Deduct usage after successful call
                 ok_consume, new_remaining = consume_code(code)
+                record_forge_time(code)
                 self._json_response(200, {"text": text, "remaining": new_remaining})
         except urllib.error.HTTPError as e:
             err = e.read().decode()
@@ -494,7 +573,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _json_response(self, code, data):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
@@ -516,6 +595,12 @@ if __name__ == "__main__":
             auth_lines.append(f"      {masked} (limit: {cap})")
     else:
         auth_lines.append("  ⚠ INVITE_CODES not set — no one can forge!")
+    auth_lines.append(f"  ✓ Rate limit: {RATE_LIMIT_SEC}s between forges")
+    auth_lines.append(f"  ✓ CORS: {ALLOWED_ORIGIN}")
+    if ADMIN_KEY:
+        auth_lines.append(f"  ✓ Admin status: /api/status?key=***")
+    else:
+        auth_lines.append("  ⚠ ADMIN_KEY not set — /api/status disabled")
     auth_block = "\n".join(auth_lines)
 
     print(f"""

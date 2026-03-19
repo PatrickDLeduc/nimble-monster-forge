@@ -1,1 +1,1 @@
-# No dependencies — uses Python standard library only
+prometheus_client>=0.20.0

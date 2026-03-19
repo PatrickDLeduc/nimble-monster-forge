@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Nimble Monster Forge — Local Server
+Nimble Monster Forge — Server with Observability
 Run: python nimble_forge_server.py
 Then open: http://localhost:8000
+Admin: http://localhost:8000/admin
 """
 
 import json
@@ -10,110 +11,292 @@ import http.server
 import urllib.request
 import urllib.error
 import os
-import threading
+import re
 import time
+import threading
+import base64
 
+# ── Prometheus Instrumentation ─────────────────────────────────────────────
+from prometheus_client import (
+    Counter, Histogram, Gauge, Info,
+    generate_latest, CONTENT_TYPE_LATEST
+)
+
+REQUESTS_TOTAL = Counter(
+    "forge_requests_total",
+    "Total HTTP requests",
+    ["endpoint", "method", "status"]
+)
+
+REQUEST_DURATION = Histogram(
+    "forge_request_duration_seconds",
+    "Request latency in seconds",
+    ["endpoint"],
+    buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
+)
+
+ACTIVE_SESSIONS = Gauge(
+    "forge_active_sessions",
+    "Approximate concurrent users (unique IPs in last 5 min)"
+)
+
+ANTHROPIC_TOKENS = Counter(
+    "forge_anthropic_tokens_total",
+    "Tokens consumed from Anthropic API",
+    ["direction"]  # input / output
+)
+
+ANTHROPIC_COST = Counter(
+    "forge_anthropic_cost_dollars",
+    "Cumulative Anthropic API cost in USD"
+)
+
+GENERATION_TOTAL = Counter(
+    "forge_generation_total",
+    "Total monster generations",
+    ["legendary"]
+)
+
+MONSTER_OPTIONS = Counter(
+    "forge_monster_options",
+    "Feature selections for monster generation",
+    ["option_type", "option_value"]
+)
+
+AIRTABLE_SAVES = Counter(
+    "forge_airtable_saves_total",
+    "Airtable save attempts",
+    ["status"]  # success / error
+)
+
+ERRORS_TOTAL = Counter(
+    "forge_errors_total",
+    "Error occurrences",
+    ["error_type", "endpoint"]
+)
+
+APP_INFO = Info("forge", "Application metadata")
+APP_INFO.info({
+    "version": "1.1.0",
+    "app": "nimble_monster_forge",
+    "stack": "python_stdlib"
+})
+
+# ── Session Tracking ───────────────────────────────────────────────────────
+SESSION_WINDOW = 300  # 5 minutes
+_session_lock = threading.Lock()
+_session_hits = {}  # ip -> last_seen_timestamp
+
+
+def _track_session(ip):
+    """Record an IP hit and update the active sessions gauge."""
+    now = time.time()
+    with _session_lock:
+        _session_hits[ip] = now
+        cutoff = now - SESSION_WINDOW
+        expired = [k for k, v in _session_hits.items() if v < cutoff]
+        for k in expired:
+            del _session_hits[k]
+        ACTIVE_SESSIONS.set(len(_session_hits))
+
+
+# ── Anthropic Pricing (Sonnet 4) ──────────────────────────────────────────
+INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
+OUTPUT_COST_PER_TOKEN = 15.0 / 1_000_000
+
+
+# ── Grafana Cloud Remote Write Push ───────────────────────────────────────
+GRAFANA_REMOTE_WRITE_URL = os.environ.get("GRAFANA_REMOTE_WRITE_URL", "")
+GRAFANA_USER = os.environ.get("GRAFANA_USER", "")
+GRAFANA_API_KEY = os.environ.get("GRAFANA_API_KEY", "")
+PUSH_INTERVAL = 15  # seconds
+
+
+def _push_metrics_loop():
+    """Background thread: push metrics to Grafana Cloud every PUSH_INTERVAL seconds."""
+    if not GRAFANA_REMOTE_WRITE_URL:
+        print("  [metrics] No GRAFANA_REMOTE_WRITE_URL — push disabled (local /metrics still works)")
+        return
+
+    print(f"  [metrics] Pushing to Grafana Cloud every {PUSH_INTERVAL}s")
+
+    while True:
+        time.sleep(PUSH_INTERVAL)
+        try:
+            metrics_data = generate_latest()
+            auth_string = f"{GRAFANA_USER}:{GRAFANA_API_KEY}"
+            auth_bytes = base64.b64encode(auth_string.encode()).decode()
+
+            req = urllib.request.Request(
+                GRAFANA_REMOTE_WRITE_URL,
+                data=metrics_data,
+                headers={
+                    "Content-Type": CONTENT_TYPE_LATEST,
+                    "Authorization": f"Basic {auth_bytes}",
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as res:
+                if res.status >= 300:
+                    print(f"  [metrics] Push warning: HTTP {res.status}")
+        except Exception as e:
+            print(f"  [metrics] Push error: {e}")
+
+
+# ── Admin Dashboard HTML ──────────────────────────────────────────────────
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "nimbleforge")
+GRAFANA_DASHBOARD_URL = os.environ.get("GRAFANA_DASHBOARD_URL", "")
+
+ADMIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nimble Monster Forge — Admin</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&family=Outfit:wght@300;400;500;600&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#0c0e14;color:#c8cdd8;font-family:'Outfit',sans-serif;min-height:100vh;padding:24px}
+  .wrap{max-width:1200px;margin:0 auto}
+  h1{font-size:20px;font-weight:600;color:#e8ecf4;margin-bottom:4px}
+  .sub{font-family:'JetBrains Mono',monospace;font-size:12px;color:#6b7280;margin-bottom:24px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:24px}
+  .card{background:#13161f;border:1px solid #252a3a;border-radius:10px;padding:20px}
+  .card-title{font-family:'JetBrains Mono',monospace;font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+  .card-value{font-size:28px;font-weight:600;color:#e8ecf4}
+  .accent{color:#e8a825}
+  .green{color:#34d399}
+  .blue{color:#60a5fa}
+  .grafana-frame{width:100%;height:400px;border:1px solid #252a3a;border-radius:10px;background:#13161f;margin-bottom:16px}
+  .hint{font-family:'JetBrains Mono',monospace;font-size:11px;color:#6b7280;margin-top:8px;padding:12px;background:#13161f;border:1px solid #252a3a;border-radius:8px;line-height:1.8}
+  .back{color:#6b7280;text-decoration:none;font-size:13px;display:inline-block;margin-bottom:16px}
+  .back:hover{color:#e8ecf4}
+  .section{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;letter-spacing:1.5px;text-transform:uppercase;color:#6b7280;margin:24px 0 12px 4px}
+  .live-metrics{font-family:'JetBrains Mono',monospace;font-size:12px;color:#c8cdd8;background:#13161f;border:1px solid #252a3a;border-radius:8px;padding:16px;white-space:pre-wrap;max-height:500px;overflow:auto;line-height:1.6}
+  .refresh-btn{background:none;border:1px solid #252a3a;color:#6b7280;padding:6px 14px;border-radius:6px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:11px;margin-left:12px}
+  .refresh-btn:hover{border-color:#3a4060;color:#e8ecf4}
+  .heatmap{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .heat-chip{padding:4px 10px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;border:1px solid #252a3a}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&#8592; Back to Monster Forge</a>
+  <h1>&#128202; Admin Dashboard</h1>
+  <p class="sub">nimble monster forge — observability</p>
+
+  <div class="grid" id="cards">
+    <div class="card"><div class="card-title">Total Generations</div><div class="card-value" id="v-gens">—</div></div>
+    <div class="card"><div class="card-title">Total Cost</div><div class="card-value accent" id="v-cost">—</div></div>
+    <div class="card"><div class="card-title">Active Sessions</div><div class="card-value green" id="v-sessions">—</div></div>
+    <div class="card"><div class="card-title">Total Requests</div><div class="card-value blue" id="v-requests">—</div></div>
+    <div class="card"><div class="card-title">Input Tokens</div><div class="card-value" id="v-intokens">—</div></div>
+    <div class="card"><div class="card-title">Output Tokens</div><div class="card-value" id="v-outtokens">—</div></div>
+  </div>
+
+  <div class="section">Monster Options Heatmap</div>
+  <div id="heatmap-container" class="card" style="min-height:60px">Loading...</div>
+
+  GRAFANA_EMBED_PLACEHOLDER
+
+  <div class="section">
+    Live Prometheus Metrics
+    <button class="refresh-btn" onclick="loadMetrics()">Refresh</button>
+  </div>
+  <div class="live-metrics" id="raw-metrics">Loading...</div>
+</div>
+
+<script>
+async function loadMetrics() {
+  try {
+    const res = await fetch('/metrics');
+    const text = await res.text();
+    document.getElementById('raw-metrics').textContent = text;
+
+    const get = (name, labels) => {
+      const pattern = labels
+        ? new RegExp('^' + name + '\\{' + labels + '\\}\\s+([\\d.e+-]+)', 'm')
+        : new RegExp('^' + name + '\\s+([\\d.e+-]+)', 'm');
+      const match = text.match(pattern);
+      return match ? parseFloat(match[1]) : 0;
+    };
+
+    const sumAll = (name) => {
+      const re = new RegExp('^' + name + '(?:_total|_created)?(?:\\{[^}]*\\})?\\s+([\\d.e+-]+)', 'gm');
+      let total = 0, m;
+      while ((m = re.exec(text)) !== null) total += parseFloat(m[1]);
+      return total;
+    };
+
+    // Generations
+    const gens = get('forge_generation_total', '[^}]*legendary="true"[^}]*')
+              + get('forge_generation_total', '[^}]*legendary="false"[^}]*');
+    document.getElementById('v-gens').textContent = gens;
+
+    // Cost
+    const cost = get('forge_anthropic_cost_dollars_total') || get('forge_anthropic_cost_dollars');
+    document.getElementById('v-cost').textContent = '$' + cost.toFixed(4);
+
+    // Sessions
+    document.getElementById('v-sessions').textContent = get('forge_active_sessions');
+
+    // Total requests
+    const reqRe = /^forge_requests_total\{[^}]*\}\s+([\d.e+-]+)/gm;
+    let totalReqs = 0, rm;
+    while ((rm = reqRe.exec(text)) !== null) totalReqs += parseFloat(rm[1]);
+    document.getElementById('v-requests').textContent = totalReqs;
+
+    // Tokens
+    document.getElementById('v-intokens').textContent =
+      get('forge_anthropic_tokens_total', '[^}]*direction="input"[^}]*').toLocaleString();
+    document.getElementById('v-outtokens').textContent =
+      get('forge_anthropic_tokens_total', '[^}]*direction="output"[^}]*').toLocaleString();
+
+    // Heatmap — parse forge_monster_options lines
+    const heatRe = /^forge_monster_options_total\{option_type="([^"]+)",option_value="([^"]+)"\}\s+([\d.e+-]+)/gm;
+    const options = {};
+    let hm;
+    while ((hm = heatRe.exec(text)) !== null) {
+      const type = hm[1], value = hm[2], count = parseFloat(hm[3]);
+      if (count > 0) {
+        if (!options[type]) options[type] = [];
+        options[type].push({ value, count });
+      }
+    }
+
+    let heatHtml = '';
+    const maxCount = Math.max(1, ...Object.values(options).flatMap(arr => arr.map(o => o.count)));
+    for (const [type, vals] of Object.entries(options).sort()) {
+      vals.sort((a, b) => b.count - a.count);
+      heatHtml += '<div style="margin-bottom:12px"><div style="font-size:12px;color:#6b7280;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">' + type + '</div><div class="heatmap">';
+      for (const { value, count } of vals) {
+        const intensity = Math.round((count / maxCount) * 255);
+        const bg = 'rgba(' + intensity + ',' + Math.round(intensity * 0.65) + ',20,0.3)';
+        const border = 'rgba(' + intensity + ',' + Math.round(intensity * 0.65) + ',20,0.6)';
+        heatHtml += '<span class="heat-chip" style="background:' + bg + ';border-color:' + border + ';color:rgb(' + Math.min(255, intensity + 80) + ',' + Math.min(255, Math.round(intensity * 0.65) + 60) + ',40)">' + value + ' <b>' + count + '</b></span>';
+      }
+      heatHtml += '</div></div>';
+    }
+    document.getElementById('heatmap-container').innerHTML = heatHtml || '<span style="color:#6b7280">No monster generations yet</span>';
+
+  } catch(e) {
+    document.getElementById('raw-metrics').textContent = 'Error: ' + e.message;
+  }
+}
+
+loadMetrics();
+setInterval(loadMetrics, 15000);
+</script>
+</body></html>"""
+
+
+# ── Configuration ─────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8000))
 
-# ── Invite Code Auth ──────────────────────────────────────────────
-# Environment variables (set these on Render.com):
-#   ANTHROPIC_API_KEY  — your sk-ant-... key
-#   INVITE_CODES       — comma-separated, e.g. "dragon:50,phoenix:50,friends:200"
-#   DEFAULT_USAGE_CAP  — default max uses per code (default: 50)
-#   ALLOWED_ORIGIN     — your Render URL, e.g. "https://nimble-monster-forge.onrender.com"
-#   ADMIN_KEY          — secret key to access /api/status, e.g. "mysecretkey123"
-#   RATE_LIMIT_SEC     — seconds between forges per code (default: 10)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-DEFAULT_CAP = int(os.environ.get("DEFAULT_USAGE_CAP", "50"))
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")  # "*" for local dev
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
-RATE_LIMIT_SEC = int(os.environ.get("RATE_LIMIT_SEC", "10"))
-
-# Parse invite codes: "code1:cap,code2:cap,code3" (no cap = default)
-_raw_codes = os.environ.get("INVITE_CODES", "")
-INVITE_CODES = {}  # {code_lower: max_uses}
-for _entry in _raw_codes.split(","):
-    _entry = _entry.strip()
-    if not _entry:
-        continue
-    if ":" in _entry:
-        _code, _cap = _entry.rsplit(":", 1)
-        INVITE_CODES[_code.strip().lower()] = int(_cap.strip())
-    else:
-        INVITE_CODES[_entry.lower()] = DEFAULT_CAP
-
-# In-memory usage tracking {code_lower: count}
-_usage = {}
-_usage_lock = threading.Lock()
-
-
-def validate_code(code):
-    """Returns (ok, message, remaining)"""
-    if not code:
-        return False, "No invite code provided.", None
-    c = code.strip().lower()
-    if c not in INVITE_CODES:
-        return False, "Invalid invite code.", None
-    cap = INVITE_CODES[c]
-    with _usage_lock:
-        used = _usage.get(c, 0)
-    remaining = cap - used
-    if remaining <= 0:
-        return False, f"This code has reached its limit ({cap} uses).", 0
-    return True, "Valid", remaining
-
-
-def consume_code(code):
-    """Deduct one use. Call after successful API call."""
-    c = code.strip().lower()
-    cap = INVITE_CODES.get(c, 0)
-    with _usage_lock:
-        used = _usage.get(c, 0)
-        if used >= cap:
-            return False, 0
-        _usage[c] = used + 1
-        return True, cap - (used + 1)
-
-
-# Rate limiter: {code_lower: last_forge_timestamp}
-_last_forge = {}
-
-
-def check_rate_limit(code):
-    """Returns (ok, seconds_to_wait)"""
-    c = code.strip().lower()
-    now = time.time()
-    with _usage_lock:
-        last = _last_forge.get(c, 0)
-        elapsed = now - last
-        if elapsed < RATE_LIMIT_SEC:
-            return False, round(RATE_LIMIT_SEC - elapsed)
-        return True, 0
-
-
-def record_forge_time(code):
-    """Record that a forge just happened for rate limiting."""
-    c = code.strip().lower()
-    with _usage_lock:
-        _last_forge[c] = time.time()
-
-
-def get_all_status():
-    """Return usage stats for all codes (for admin endpoint)."""
-    with _usage_lock:
-        return {
-            code: {
-                "used": _usage.get(code, 0),
-                "cap": cap,
-                "remaining": cap - _usage.get(code, 0),
-                "last_forge": round(_last_forge.get(code, 0))
-            }
-            for code, cap in INVITE_CODES.items()
-        }
-
-_server_start = time.time()
-# ── End Auth ──────────────────────────────────────────────────────
+# ── Frontend HTML ─────────────────────────────────────────────────────────
+# Only change from original: generate() now sends an `options` object
+# alongside the prompt so the server can track feature selections.
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -211,12 +394,12 @@ RULES:
 JSON SCHEMA (respond with EXACTLY this structure):
 {"name":"","level":0,"hp":0,"armor":"None","speed":6,"fly":null,"burrow":null,"size":"Medium","dpr":0,"save_dc":0,"attacks":"Attack1. dice+mod. Effect. | Attack2. dice+mod.","trait":"Trait Name. Description.","abilities":"Ability1. Description. | Ability2. Description.","legendary":false,"bloodied":"","last_stand":"","last_stand_hp":null,"saves":"","lore":"","tips":"","encounter":"","balance":"","tags":"tag1, tag2","family":""}`;
 
-let state={heroes:[{name:"",cls:"Berserker",level:3}],theme:[],env:[],diff:"Hard",legendary:false,custom:"",size:"",loading:false,error:null,monster:null,showExport:null,showConfig:false,cfg:JSON.parse(localStorage.getItem("nimble_cfg")||'{"inviteCode":"","atToken":"","atBase":"","atTable":""}'),atStatus:null,atError:null,atWarnings:null,codeStatus:null};
+let state={heroes:[{name:"",cls:"Berserker",level:3}],theme:[],env:[],diff:"Hard",legendary:false,custom:"",size:"",loading:false,error:null,monster:null,showExport:null,showConfig:false,cfg:JSON.parse(localStorage.getItem("nimble_cfg")||'{"anthropicKey":"","atToken":"","atBase":"","atTable":""}'),atStatus:null,atError:null,atWarnings:null};
 
 function saveCfg(){localStorage.setItem("nimble_cfg",JSON.stringify(state.cfg))}
 function totalLvl(){return state.heroes.reduce((s,h)=>s+(parseInt(h.level)||1),0)}
 function avgLvl(){return Math.round(totalLvl()/state.heroes.length)}
-function hasCfg(){return !!state.cfg.inviteCode}
+function hasCfg(){return !!state.cfg.anthropicKey}
 function hasAt(){return state.cfg.atToken&&state.cfg.atBase&&state.cfg.atTable}
 
 function parseResponse(text){
@@ -249,17 +432,28 @@ function toFields(m){
 
 async function generate(){
   state.loading=true;state.error=null;state.monster=null;state.atStatus=null;state.atWarnings=null;state.showExport=null;render();
-  if(!state.cfg.inviteCode){state.loading=false;state.error="Enter your invite code in Settings first.";state.showConfig=true;render();return}
+  if(!state.cfg.anthropicKey){state.loading=false;state.error="Set your Anthropic API key in Settings first.";state.showConfig=true;render();return}
   const party=state.heroes.map((h,i)=>`${h.name||"Hero "+(i+1)}: Level ${h.level} ${h.cls}`).join(", ");
   const prompt=`Create a ${state.legendary?"LEGENDARY ":""}monster for: ${party} (${state.heroes.length} heroes, total levels ${totalLvl()}). Difficulty: ${state.diff}. Theme: ${state.theme.join(", ")||"any"}. Environment: ${state.env.join(", ")||"any"}. ${state.size?"Size: "+state.size+".":""} ${state.legendary?"Use Legendary table at party level "+avgLvl()+".":""} ${state.custom}`;
+
+  // Send structured options alongside prompt for server-side metrics
+  const options = {
+    themes: state.theme,
+    environments: state.env,
+    difficulty: state.diff,
+    legendary: state.legendary,
+    size: state.size || "Any",
+    party_size: state.heroes.length,
+    classes: state.heroes.map(h => h.cls)
+  };
+
   try{
     const res=await fetch("/api/claude",{
       method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({code:state.cfg.inviteCode,system:SYSTEM_PROMPT,prompt:prompt})
+      body:JSON.stringify({key:state.cfg.anthropicKey,system:SYSTEM_PROMPT,prompt:prompt,options:options})
     });
     const data=await res.json();
     if(data.error)throw new Error(data.error);
-    if(data.remaining!==undefined)state.codeStatus={ok:true,remaining:data.remaining};
     state.monster=parseResponse(data.text);
   }catch(e){state.error=e.message}
   state.loading=false;render();
@@ -283,18 +477,6 @@ async function saveToAirtable(){
   render();
 }
 
-async function validateCode(){
-  const code=state.cfg.inviteCode;
-  if(!code){state.codeStatus=null;render();return}
-  try{
-    const res=await fetch("/api/validate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:code})});
-    const data=await res.json();
-    if(data.ok){state.codeStatus={ok:true,remaining:data.remaining}}
-    else{state.codeStatus={ok:false,error:data.error}}
-  }catch(e){state.codeStatus={ok:false,error:"Could not reach server."}}
-  render();
-}
-
 function esc(s){return(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
 
 function render(){
@@ -302,23 +484,21 @@ function render(){
   function chips(list,sel,fn){return list.map(v=>`<span class="chip ${sel.includes(v)?'on':''}" onclick="${fn}('${v}')">${v}</span>`).join("")}
   function rchips(list,cur,fn){return list.map(v=>`<span class="chip ${cur===v?'on':''}" onclick="${fn}('${v}')">${v}</span>`).join("")}
 
-  let h=`<div class="top-bar"><h1>⚔ NIMBLE MONSTER FORGE</h1>
-    <button class="btn-cfg ${hasCfg()?'on':''}" onclick="state.showConfig=!state.showConfig;render()">${hasCfg()?"● Settings":"⚙ Settings"}</button></div>
+  let h=`<div class="top-bar"><h1>&#9876; NIMBLE MONSTER FORGE</h1>
+    <button class="btn-cfg ${hasCfg()?'on':''}" onclick="state.showConfig=!state.showConfig;render()">${hasCfg()?"&#9679; Settings":"&#9881; Settings"}</button></div>
     <p class="sub">AI-powered creature design for Nimble RPG</p>`;
 
-  if(state.showConfig){const c=state.cfg;const cs=state.codeStatus;
-    h+=`<div class="config-panel"><span class="gold" style="font-family:Cinzel,serif;font-size:14px;font-weight:bold;letter-spacing:1px">SETTINGS</span>
-    <div style="margin-top:16px;margin-bottom:12px"><label class="section">Invite Code</label>
-    <input id="cfgCode" value="${esc(c.inviteCode||'')}" placeholder="Enter your invite code"><div class="hint">Get a code from the forge master</div>`;
-    if(cs){if(cs.ok){h+=`<div style="color:#6cb86c;font-size:12px;margin-top:4px">✓ Valid — ${cs.remaining} forges remaining</div>`}else{h+=`<div style="color:#e88;font-size:12px;margin-top:4px">✗ ${esc(cs.error||'Invalid')}</div>`}}
-    h+=`</div>
+  if(state.showConfig){const c=state.cfg;
+    h+=`<div class="config-panel"><span class="gold" style="font-family:Cinzel,serif;font-size:14px;font-weight:bold;letter-spacing:1px">API SETTINGS</span>
+    <div style="margin-top:16px;margin-bottom:12px"><label class="section">Anthropic API Key</label>
+    <input type="password" id="cfgA" value="${esc(c.anthropicKey)}" placeholder="sk-ant-..."><div class="hint">console.anthropic.com/settings/keys</div></div>
     <div style="margin-bottom:12px"><label class="section">Airtable Token</label>
     <input type="password" id="cfgT" value="${esc(c.atToken)}" placeholder="pat..."><div class="hint">airtable.com/create/tokens — needs data.records:write</div></div>
     <div style="margin-bottom:12px"><label class="section">Airtable Base ID</label>
     <input id="cfgB" value="${esc(c.atBase)}" placeholder="appXXXXXXXXXXXXXX"></div>
     <div style="margin-bottom:16px"><label class="section">Airtable Monsters Table ID</label>
     <input id="cfgTbl" value="${esc(c.atTable)}" placeholder="tblXXXXXXXXXXXXXX"><div class="hint">Both IDs from your URL: airtable.com/appXXX/tblXXX/...</div></div>
-    <div style="display:flex;gap:8px"><button class="btn-save-cfg" onclick="state.cfg={inviteCode:document.getElementById('cfgCode').value,atToken:document.getElementById('cfgT').value,atBase:document.getElementById('cfgB').value,atTable:document.getElementById('cfgTbl').value};saveCfg();validateCode();state.showConfig=false;render()">Save</button>
+    <div style="display:flex;gap:8px"><button class="btn-save-cfg" onclick="state.cfg={anthropicKey:document.getElementById('cfgA').value,atToken:document.getElementById('cfgT').value,atBase:document.getElementById('cfgB').value,atTable:document.getElementById('cfgTbl').value};saveCfg();state.showConfig=false;render()">Save</button>
     <button class="btn-cancel" onclick="state.showConfig=false;render()">Cancel</button></div></div>`}
 
   h+=`<div class="group"><div style="display:flex;justify-content:space-between;margin-bottom:8px">
@@ -328,7 +508,7 @@ function render(){
     h+=`<div class="row"><input placeholder="Name" value="${esc(hr.name)}" oninput="state.heroes[${i}].name=this.value">
     <select onchange="state.heroes[${i}].cls=this.value">${opts}</select>
     <input class="lvl" type="number" min="1" max="20" value="${hr.level}" onchange="state.heroes[${i}].level=parseInt(this.value)||1">
-    ${state.heroes.length>1?`<button class="btn-rm" onclick="state.heroes.splice(${i},1);render()">×</button>`:""}</div>`});
+    ${state.heroes.length>1?`<button class="btn-rm" onclick="state.heroes.splice(${i},1);render()">&#215;</button>`:""}</div>`});
   h+=`<button class="btn-add" onclick="state.heroes.push({name:'',cls:'Berserker',level:${avgLvl()||1}});render()">+ Add Hero</button></div>`;
 
   h+=`<div class="group"><label class="section">Difficulty</label><div class="chips">${rchips(["Easy","Medium","Hard","Deadly","Very Deadly"],state.diff,"setDiff")}</div></div>`;
@@ -340,7 +520,7 @@ function render(){
   <label class="cb-label" style="color:${state.legendary?'#d4a832':'#8a7a5a'}"><input type="checkbox" ${state.legendary?"checked":""} onchange="state.legendary=this.checked;render()" style="accent-color:#d4a832"> Legendary</label></div>`;
 
   h+=`<div class="group"><label class="section">Custom Instructions</label><textarea placeholder="e.g. 'A corrupted treant' or 'punishes ranged attackers'" oninput="state.custom=this.value">${esc(state.custom)}</textarea></div>`;
-  h+=`<button class="btn-forge" ${state.loading?"disabled":""} onclick="generate()">${state.loading?"Forging...":"⚒ Forge Monster"}</button>`;
+  h+=`<button class="btn-forge" ${state.loading?"disabled":""} onclick="generate()">${state.loading?"Forging...":"&#9874; Forge Monster"}</button>`;
   if(state.error)h+=`<div class="error">${esc(state.error)}</div>`;
 
   if(m){
@@ -352,12 +532,12 @@ function render(){
     h+=`<div class="stat-block" id="result"><div class="bar top"></div>
     <div style="display:flex;justify-content:space-between;align-items:flex-start"><div>
     <div class="stat-name">${esc(m.name)}</div>
-    <div class="muted" style="font-size:12px;margin-top:4px">Lvl ${m.level} • ${m.size} • ${m.armor==="None"?"Unarmored":m.armor} • Speed ${spd} • DC ${m.save_dc}${m.legendary?" • LEGENDARY":""}</div></div>
+    <div class="muted" style="font-size:12px;margin-top:4px">Lvl ${m.level} &#8226; ${m.size} &#8226; ${m.armor==="None"?"Unarmored":m.armor} &#8226; Speed ${spd} &#8226; DC ${m.save_dc}${m.legendary?" &#8226; LEGENDARY":""}</div></div>
     <div style="display:flex;align-items:center;gap:6px">${ab?`<span class="armor-badge">${ab}</span>`:""}<span class="hp-box">${m.hp}</span></div></div><div class="divider"></div>`;
 
     if(m.trait){const p=m.trait.split(".");h+=`<div style="margin-bottom:8px;font-size:14px"><span class="gold" style="font-weight:600">${esc(p[0])}.</span> ${esc(p.slice(1).join(".").trim())}</div>`}
     abilities.forEach(a=>{const p=a.split(".");h+=`<div style="margin-bottom:6px;font-size:14px"><span class="gold" style="font-weight:600">${esc(p[0])}.</span> ${esc(p.slice(1).join(".").trim())}</div>`});
-    attacks.forEach(a=>{const p=a.split(".");h+=`<div style="margin-bottom:5px;font-size:14px"><b>• ${esc(p[0])}.</b> ${esc(p.slice(1).join(".").trim())}</div>`});
+    attacks.forEach(a=>{const p=a.split(".");h+=`<div style="margin-bottom:5px;font-size:14px"><b>&#8226; ${esc(p[0])}.</b> ${esc(p.slice(1).join(".").trim())}</div>`});
     if(m.legendary&&m.bloodied)h+=`<div class="divider"></div><div style="margin-bottom:6px;font-size:14px"><span class="red">Bloodied: </span>${esc(m.bloodied)}</div>`;
     if(m.legendary&&m.last_stand)h+=`<div style="margin-bottom:6px;font-size:14px"><span class="red">Last Stand: </span>${esc(m.last_stand)}${m.last_stand_hp?" ("+m.last_stand_hp+" more HP to kill.)":""}</div>`;
     if(m.saves)h+=`<div class="muted" style="font-size:12px;margin-top:6px">Saves: ${esc(m.saves)}</div>`;
@@ -368,13 +548,13 @@ function render(){
     h+=`<div class="bar bot"></div></div>`;
 
     const atCls=state.atStatus==="saving"?"saving":state.atStatus==="saved"?"saved":state.atStatus==="error"?"err":"";
-    const atLbl=state.atStatus==="saving"?"Saving...":state.atStatus==="saved"?"✓ Saved!":state.atStatus==="error"?"✗ Retry":"Save to Airtable";
+    const atLbl=state.atStatus==="saving"?"Saving...":state.atStatus==="saved"?"&#10003; Saved!":state.atStatus==="error"?"&#10007; Retry":"Save to Airtable";
     h+=`<div class="actions"><button class="btn-at ${atCls}" onclick="saveToAirtable()" ${state.atStatus==="saving"?"disabled":""}>${atLbl}</button>
-    <button class="btn-exp ${state.showExport==="statblock"?"on":""}" onclick="state.showExport=state.showExport==='statblock'?null:'statblock';render()">${state.showExport==="statblock"?"▾":"▸"} Stat Block</button>
-    <button class="btn-exp ${state.showExport==="json"?"on":""}" onclick="state.showExport=state.showExport==='json'?null:'json';render()">${state.showExport==="json"?"▾":"▸"} JSON</button></div>`;
+    <button class="btn-exp ${state.showExport==="statblock"?"on":""}" onclick="state.showExport=state.showExport==='statblock'?null:'statblock';render()">${state.showExport==="statblock"?"&#9662;":"&#9656;"} Stat Block</button>
+    <button class="btn-exp ${state.showExport==="json"?"on":""}" onclick="state.showExport=state.showExport==='json'?null:'json';render()">${state.showExport==="json"?"&#9662;":"&#9656;"} JSON</button></div>`;
 
     if(state.atStatus==="saved"&&!state.atWarnings)h+=`<div class="status ok">Record created in your Monsters table!</div>`;
-    if(state.atStatus==="saved"&&state.atWarnings&&state.atWarnings.length>0)h+=`<div class="status" style="color:#d4a832">⚠ Saved with ${state.atWarnings.length} field(s) dropped (logged in Notes):<br><span class="dim" style="font-size:12px">${esc(state.atWarnings.join(" | "))}</span></div>`;
+    if(state.atStatus==="saved"&&state.atWarnings&&state.atWarnings.length>0)h+=`<div class="status" style="color:#d4a832">&#9888; Saved with ${state.atWarnings.length} field(s) dropped (logged in Notes):<br><span class="dim" style="font-size:12px">${esc(state.atWarnings.join(" | "))}</span></div>`;
     if(state.atStatus==="error")h+=`<div class="status err">${esc(state.atError||"Unknown error")}</div>`;
 
     if(state.showExport){let txt="";
@@ -389,81 +569,105 @@ window.setDiff=v=>{state.diff=v;render()};
 window.toggleTheme=v=>{state.theme=state.theme.includes(v)?state.theme.filter(x=>x!==v):[...state.theme,v];render()};
 window.toggleEnv=v=>{state.env=state.env.includes(v)?state.env.filter(x=>x!==v):[...state.env,v];render()};
 render();
-validateCode();
 </script>
 </body></html>"""
 
+
+# ── HTTP Handler ──────────────────────────────────────────────────────────
+
 class Handler(http.server.BaseHTTPRequestHandler):
+
     def do_OPTIONS(self):
-        """Handle CORS preflight requests."""
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
     def do_GET(self):
-        if self.path.startswith("/api/status"):
-            self._admin_status()
-        else:
+        start = time.time()
+
+        if self.path == "/metrics":
+            metrics_data = generate_latest()
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.end_headers()
+            self.wfile.write(metrics_data)
+            return
+
+        if self.path == "/admin":
+            if not self._check_admin_auth():
+                return
+            admin_page = ADMIN_HTML
+            if GRAFANA_DASHBOARD_URL:
+                embed_html = (
+                    '<div class="section">Grafana Dashboard</div>'
+                    f'<iframe class="grafana-frame" src="{GRAFANA_DASHBOARD_URL}" frameborder="0"></iframe>'
+                )
+            else:
+                embed_html = (
+                    '<div class="hint">'
+                    '<strong>Grafana embeds not configured yet.</strong><br><br>'
+                    'Set GRAFANA_DASHBOARD_URL env var to your Grafana Cloud panel embed URL.<br>'
+                    'The live metrics below are pulled directly from /metrics.'
+                    '</div>'
+                )
+            admin_page = admin_page.replace("GRAFANA_EMBED_PLACEHOLDER", embed_html)
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            self.wfile.write(HTML.encode())
+            self.wfile.write(admin_page.encode())
+            _track_session(self.client_address[0])
+            REQUESTS_TOTAL.labels(endpoint="/admin", method="GET", status="200").inc()
+            REQUEST_DURATION.labels(endpoint="/admin").observe(time.time() - start)
+            return
+
+        if self.path == "/health":
+            self._json_response(200, {"status": "ok", "uptime": time.time() - SERVER_START})
+            return
+
+        # Serve frontend
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(HTML.encode())
+        _track_session(self.client_address[0])
+        REQUESTS_TOTAL.labels(endpoint="/", method="GET", status="200").inc()
+        REQUEST_DURATION.labels(endpoint="/").observe(time.time() - start)
 
     def do_POST(self):
+        start = time.time()
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
+        _track_session(self.client_address[0])
 
         if self.path == "/api/claude":
-            self._proxy_claude(body)
+            self._proxy_claude(body, start)
         elif self.path == "/api/airtable":
-            self._proxy_airtable(body)
-        elif self.path == "/api/validate":
-            self._validate_code(body)
+            self._proxy_airtable(body, start)
         else:
             self._json_response(404, {"error": "Not found"})
+            REQUESTS_TOTAL.labels(endpoint=self.path, method="POST", status="404").inc()
 
-    def _validate_code(self, body):
-        code = body.get("code", "")
-        ok, msg, remaining = validate_code(code)
-        if ok:
-            self._json_response(200, {"ok": True, "remaining": remaining})
-        else:
-            self._json_response(403, {"ok": False, "error": msg, "remaining": remaining})
+    def _check_admin_auth(self):
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode()
+                _, password = decoded.split(":", 1)
+                if password == ADMIN_KEY:
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Nimble Forge Admin"')
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<h1>401 Unauthorized</h1><p>Admin access required.</p>")
+        return False
 
-    def _admin_status(self):
-        """GET /api/status?key=ADMIN_KEY — check usage from your phone."""
-        from urllib.parse import urlparse, parse_qs
-        query = parse_qs(urlparse(self.path).query)
-        key = query.get("key", [""])[0]
-        if not ADMIN_KEY or key != ADMIN_KEY:
-            self._json_response(403, {"error": "Invalid or missing admin key."})
-            return
-        self._json_response(200, {
-            "codes": get_all_status(),
-            "server_uptime_sec": round(time.time() - _server_start),
-            "api_key_set": bool(ANTHROPIC_API_KEY)
-        })
-
-    def _proxy_claude(self, body):
-        # Validate invite code first
-        code = body.get("code", "")
-        ok, msg, remaining = validate_code(code)
-        if not ok:
-            self._json_response(403, {"error": msg})
-            return
-        if not ANTHROPIC_API_KEY:
-            self._json_response(500, {"error": "Server API key not configured. Ask the forge master."})
-            return
-
-        # Rate limit check
-        rate_ok, wait_sec = check_rate_limit(code)
-        if not rate_ok:
-            self._json_response(429, {"error": f"Slow down — wait {wait_sec} more second{'s' if wait_sec != 1 else ''}.", "retry_after": wait_sec})
-            return
-
+    def _proxy_claude(self, body, start):
+        options = body.get("options", {})
         try:
             payload = json.dumps({
                 "model": "claude-sonnet-4-20250514",
@@ -476,17 +680,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data=payload,
                 headers={
                     "Content-Type": "application/json",
-                    "x-api-key": ANTHROPIC_API_KEY,
+                    "x-api-key": body.get("key", ""),
                     "anthropic-version": "2023-06-01"
                 }
             )
             with urllib.request.urlopen(req) as res:
                 data = json.loads(res.read())
                 text = "".join(b.get("text", "") for b in data.get("content", []))
-                # Deduct usage after successful call
-                ok_consume, new_remaining = consume_code(code)
-                record_forge_time(code)
-                self._json_response(200, {"text": text, "remaining": new_remaining})
+
+                # ── Token usage & cost tracking ──
+                usage = data.get("usage", {})
+                input_tokens = usage.get("input_tokens", 0)
+                output_tokens = usage.get("output_tokens", 0)
+                ANTHROPIC_TOKENS.labels(direction="input").inc(input_tokens)
+                ANTHROPIC_TOKENS.labels(direction="output").inc(output_tokens)
+                cost = (input_tokens * INPUT_COST_PER_TOKEN) + (output_tokens * OUTPUT_COST_PER_TOKEN)
+                ANTHROPIC_COST.inc(cost)
+
+                # ── Monster options tracking ──
+                is_legendary = str(options.get("legendary", False)).lower()
+                GENERATION_TOTAL.labels(legendary=is_legendary).inc()
+                for theme in options.get("themes", []):
+                    MONSTER_OPTIONS.labels(option_type="theme", option_value=theme).inc()
+                for env in options.get("environments", []):
+                    MONSTER_OPTIONS.labels(option_type="environment", option_value=env).inc()
+                if options.get("difficulty"):
+                    MONSTER_OPTIONS.labels(option_type="difficulty", option_value=options["difficulty"]).inc()
+                if options.get("size"):
+                    MONSTER_OPTIONS.labels(option_type="size", option_value=options["size"]).inc()
+                for cls in options.get("classes", []):
+                    MONSTER_OPTIONS.labels(option_type="class", option_value=cls).inc()
+                if options.get("party_size"):
+                    MONSTER_OPTIONS.labels(option_type="party_size", option_value=str(options["party_size"])).inc()
+
+                self._json_response(200, {"text": text})
+                REQUESTS_TOTAL.labels(endpoint="/api/claude", method="POST", status="200").inc()
+                REQUEST_DURATION.labels(endpoint="/api/claude").observe(time.time() - start)
+                print(f"  [metrics] Generation: {input_tokens} in / {output_tokens} out = ${cost:.4f}")
+
         except urllib.error.HTTPError as e:
             err = e.read().decode()
             try:
@@ -494,10 +725,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 msg = err
             self._json_response(e.code, {"error": msg})
+            REQUESTS_TOTAL.labels(endpoint="/api/claude", method="POST", status=str(e.code)).inc()
+            ERRORS_TOTAL.labels(error_type="anthropic_http", endpoint="/api/claude").inc()
+            REQUEST_DURATION.labels(endpoint="/api/claude").observe(time.time() - start)
         except Exception as e:
             self._json_response(500, {"error": str(e)})
+            REQUESTS_TOTAL.labels(endpoint="/api/claude", method="POST", status="500").inc()
+            ERRORS_TOTAL.labels(error_type="anthropic_exception", endpoint="/api/claude").inc()
+            REQUEST_DURATION.labels(endpoint="/api/claude").observe(time.time() - start)
 
-    def _proxy_airtable(self, body):
+    def _proxy_airtable(self, body, start):
         url = f"https://api.airtable.com/v0/{body['baseId']}/{body['tableId']}"
         token = body.get("token", "")
         fields = dict(body.get("fields", {}))
@@ -514,10 +751,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req) as res:
                     data = json.loads(res.read())
                     record_id = data.get("records", [{}])[0].get("id")
-                    msg = "Saved successfully"
-                    if errors_log:
-                        msg += f" (dropped {len(errors_log)} field(s): {', '.join(errors_log)})"
                     self._json_response(200, {"ok": True, "id": record_id, "warnings": errors_log})
+                    AIRTABLE_SAVES.labels(status="success").inc()
+                    REQUESTS_TOTAL.labels(endpoint="/api/airtable", method="POST", status="200").inc()
+                    REQUEST_DURATION.labels(endpoint="/api/airtable").observe(time.time() - start)
                     return
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode()
@@ -526,93 +763,88 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     err_msg = err_body
 
-                # Try to extract the problem field name from the error
-                # Common patterns: 'Unknown field name: "X"' or 'Cannot parse value for field X'
                 problem_field = None
-                import re
-                # Match: Unknown field name: "FieldName"
                 m = re.search(r'Unknown field name:\s*"([^"]+)"', err_msg)
                 if m:
                     problem_field = m.group(1)
-                # Match: Cannot parse value for field FieldName
                 if not problem_field:
                     m = re.search(r'Cannot parse value for field\s+(\w[\w\s]*\w|\w+)', err_msg)
                     if m:
                         problem_field = m.group(1).strip()
-                # Match: Field "FieldName" cannot accept...
                 if not problem_field:
                     m = re.search(r'[Ff]ield\s+"([^"]+)"', err_msg)
                     if m:
                         problem_field = m.group(1)
 
                 if problem_field and problem_field in fields:
-                    # Save the failed value, remove the field, append to error log
                     failed_value = fields.pop(problem_field)
-                    error_entry = f"{problem_field}: {failed_value}"
-                    errors_log.append(error_entry)
-                    print(f"  Airtable rejected field '{problem_field}', retrying without it (attempt {attempt + 1})")
-
-                    # Append error info to Notes field so nothing is lost
+                    errors_log.append(f"{problem_field}: {failed_value}")
+                    print(f"  Airtable rejected field '{problem_field}', retrying (attempt {attempt + 1})")
                     notes = fields.get("Notes", "")
                     if notes:
                         notes += "\n\n"
-                    notes += "⚠ IMPORT ERRORS (fields that failed to save):\n" + "\n".join(errors_log)
+                    notes += "⚠ IMPORT ERRORS:\n" + "\n".join(errors_log)
                     fields["Notes"] = notes
-                    continue  # Retry without the problem field
+                    continue
                 else:
-                    # Can't identify the problem field — give up
                     self._json_response(e.code, {"error": err_msg})
+                    AIRTABLE_SAVES.labels(status="error").inc()
+                    ERRORS_TOTAL.labels(error_type="airtable_http", endpoint="/api/airtable").inc()
+                    REQUESTS_TOTAL.labels(endpoint="/api/airtable", method="POST", status=str(e.code)).inc()
+                    REQUEST_DURATION.labels(endpoint="/api/airtable").observe(time.time() - start)
                     return
             except Exception as e:
                 self._json_response(500, {"error": str(e)})
+                AIRTABLE_SAVES.labels(status="error").inc()
+                ERRORS_TOTAL.labels(error_type="airtable_exception", endpoint="/api/airtable").inc()
+                REQUESTS_TOTAL.labels(endpoint="/api/airtable", method="POST", status="500").inc()
+                REQUEST_DURATION.labels(endpoint="/api/airtable").observe(time.time() - start)
                 return
 
-        # Exhausted retries
         self._json_response(500, {"error": f"Too many field errors. Dropped: {', '.join(errors_log)}"})
+        AIRTABLE_SAVES.labels(status="error").inc()
+        ERRORS_TOTAL.labels(error_type="airtable_retries_exhausted", endpoint="/api/airtable").inc()
+        REQUESTS_TOTAL.labels(endpoint="/api/airtable", method="POST", status="500").inc()
+        REQUEST_DURATION.labels(endpoint="/api/airtable").observe(time.time() - start)
 
     def _json_response(self, code, data):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
     def log_message(self, fmt, *args):
         msg = fmt % args
-        if "GET / " in msg or "POST /api" in msg:
+        if any(p in msg for p in ["GET / ", "POST /api", "/admin", "/metrics"]):
             print(f"  {msg}")
 
+
+# ── Server Startup ────────────────────────────────────────────────────────
+SERVER_START = time.time()
+
 if __name__ == "__main__":
-    auth_lines = []
-    if ANTHROPIC_API_KEY:
-        auth_lines.append("  ✓ API key loaded")
-    else:
-        auth_lines.append("  ⚠ ANTHROPIC_API_KEY not set!")
-    if INVITE_CODES:
-        auth_lines.append(f"  ✓ {len(INVITE_CODES)} invite code(s) active")
-        for c, cap in INVITE_CODES.items():
-            masked = c[:3] + "•" * max(0, len(c) - 3)
-            auth_lines.append(f"      {masked} (limit: {cap})")
-    else:
-        auth_lines.append("  ⚠ INVITE_CODES not set — no one can forge!")
-    auth_lines.append(f"  ✓ Rate limit: {RATE_LIMIT_SEC}s between forges")
-    auth_lines.append(f"  ✓ CORS: {ALLOWED_ORIGIN}")
-    if ADMIN_KEY:
-        auth_lines.append(f"  ✓ Admin status: /api/status?key=***")
-    else:
-        auth_lines.append("  ⚠ ADMIN_KEY not set — /api/status disabled")
-    auth_block = "\n".join(auth_lines)
+    push_thread = threading.Thread(target=_push_metrics_loop, daemon=True)
+    push_thread.start()
 
     print(f"""
 ╔══════════════════════════════════════════╗
 ║       ⚔  NIMBLE MONSTER FORGE  ⚔        ║
+║            with Observability            ║
 ║                                          ║
-║  Open: http://localhost:{PORT}              ║
-║  Stop: Ctrl+C                            ║
-╠══════════════════════════════════════════╣
-{auth_block}
+║  App:     http://localhost:{PORT}           ║
+║  Admin:   http://localhost:{PORT}/admin      ║
+║  Metrics: http://localhost:{PORT}/metrics    ║
+║  Stop:    Ctrl+C                         ║
 ╚══════════════════════════════════════════╝
 """)
+
+    if GRAFANA_REMOTE_WRITE_URL:
+        print(f"  [metrics] Remote write -> Grafana Cloud (every {PUSH_INTERVAL}s)")
+    else:
+        print("  [metrics] Local only (set GRAFANA_REMOTE_WRITE_URL for cloud push)")
+    print()
+
     server = http.server.HTTPServer(("", PORT), Handler)
     try:
         server.serve_forever()

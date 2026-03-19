@@ -105,42 +105,44 @@ INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
 OUTPUT_COST_PER_TOKEN = 15.0 / 1_000_000
 
 
-# ── Grafana Cloud Remote Write Push ───────────────────────────────────────
-GRAFANA_REMOTE_WRITE_URL = os.environ.get("GRAFANA_REMOTE_WRITE_URL", "")
-GRAFANA_USER = os.environ.get("GRAFANA_USER", "")
-GRAFANA_API_KEY = os.environ.get("GRAFANA_API_KEY", "")
-PUSH_INTERVAL = 15  # seconds
+# ── Grafana Cloud Metrics Endpoint (Pull-based) ───────────────────────────
+# Grafana Cloud scrapes your /metrics endpoint directly via their
+# "Metrics Endpoint" integration. A bearer token protects the endpoint.
+METRICS_BEARER_TOKEN = os.environ.get("METRICS_BEARER_TOKEN", "")
 
 
-def _push_metrics_loop():
-    """Background thread: push metrics to Grafana Cloud every PUSH_INTERVAL seconds."""
-    if not GRAFANA_REMOTE_WRITE_URL:
-        print("  [metrics] No GRAFANA_REMOTE_WRITE_URL — push disabled (local /metrics still works)")
+# ── Invite Code System ────────────────────────────────────────────────────
+# Format: "code1:limit1,code2:limit2" e.g. "dragon:50,phoenix:50,Mellon:100"
+# Users enter an invite code instead of their own API key.
+# The server uses ANTHROPIC_API_KEY to make calls on their behalf.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+INVITE_CODES_RAW = os.environ.get("INVITE_CODES", "")
+
+_invite_lock = threading.Lock()
+_invite_codes = {}   # code -> max_uses
+_invite_usage = {}   # code -> current_count
+
+def _parse_invite_codes():
+    """Parse INVITE_CODES env var into code->limit dict."""
+    if not INVITE_CODES_RAW:
         return
+    for entry in INVITE_CODES_RAW.split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            code, limit = entry.rsplit(":", 1)
+            try:
+                _invite_codes[code.strip()] = int(limit.strip())
+                _invite_usage[code.strip()] = 0
+            except ValueError:
+                print(f"  [invite] Warning: invalid limit for code '{code}', skipping")
 
-    print(f"  [metrics] Pushing to Grafana Cloud every {PUSH_INTERVAL}s")
+_parse_invite_codes()
 
-    while True:
-        time.sleep(PUSH_INTERVAL)
-        try:
-            metrics_data = generate_latest()
-            auth_string = f"{GRAFANA_USER}:{GRAFANA_API_KEY}"
-            auth_bytes = base64.b64encode(auth_string.encode()).decode()
-
-            req = urllib.request.Request(
-                GRAFANA_REMOTE_WRITE_URL,
-                data=metrics_data,
-                headers={
-                    "Content-Type": CONTENT_TYPE_LATEST,
-                    "Authorization": f"Basic {auth_bytes}",
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=10) as res:
-                if res.status >= 300:
-                    print(f"  [metrics] Push warning: HTTP {res.status}")
-        except Exception as e:
-            print(f"  [metrics] Push error: {e}")
+INVITE_USAGE = Counter(
+    "forge_invite_usage_total",
+    "Invite code usage",
+    ["code"]
+)
 
 
 # ── Admin Dashboard HTML ──────────────────────────────────────────────────
@@ -394,12 +396,12 @@ RULES:
 JSON SCHEMA (respond with EXACTLY this structure):
 {"name":"","level":0,"hp":0,"armor":"None","speed":6,"fly":null,"burrow":null,"size":"Medium","dpr":0,"save_dc":0,"attacks":"Attack1. dice+mod. Effect. | Attack2. dice+mod.","trait":"Trait Name. Description.","abilities":"Ability1. Description. | Ability2. Description.","legendary":false,"bloodied":"","last_stand":"","last_stand_hp":null,"saves":"","lore":"","tips":"","encounter":"","balance":"","tags":"tag1, tag2","family":""}`;
 
-let state={heroes:[{name:"",cls:"Berserker",level:3}],theme:[],env:[],diff:"Hard",legendary:false,custom:"",size:"",loading:false,error:null,monster:null,showExport:null,showConfig:false,cfg:JSON.parse(localStorage.getItem("nimble_cfg")||'{"anthropicKey":"","atToken":"","atBase":"","atTable":""}'),atStatus:null,atError:null,atWarnings:null};
+let state={heroes:[{name:"",cls:"Berserker",level:3}],theme:[],env:[],diff:"Hard",legendary:false,custom:"",size:"",loading:false,error:null,monster:null,showExport:null,showConfig:false,cfg:JSON.parse(localStorage.getItem("nimble_cfg")||'{"anthropicKey":"","inviteCode":"","atToken":"","atBase":"","atTable":""}'),atStatus:null,atError:null,atWarnings:null};
 
 function saveCfg(){localStorage.setItem("nimble_cfg",JSON.stringify(state.cfg))}
 function totalLvl(){return state.heroes.reduce((s,h)=>s+(parseInt(h.level)||1),0)}
 function avgLvl(){return Math.round(totalLvl()/state.heroes.length)}
-function hasCfg(){return !!state.cfg.anthropicKey}
+function hasCfg(){return !!(state.cfg.anthropicKey||state.cfg.inviteCode)}
 function hasAt(){return state.cfg.atToken&&state.cfg.atBase&&state.cfg.atTable}
 
 function parseResponse(text){
@@ -432,7 +434,7 @@ function toFields(m){
 
 async function generate(){
   state.loading=true;state.error=null;state.monster=null;state.atStatus=null;state.atWarnings=null;state.showExport=null;render();
-  if(!state.cfg.anthropicKey){state.loading=false;state.error="Set your Anthropic API key in Settings first.";state.showConfig=true;render();return}
+  if(!state.cfg.anthropicKey&&!state.cfg.inviteCode){state.loading=false;state.error="Enter an invite code or Anthropic API key in Settings.";state.showConfig=true;render();return}
   const party=state.heroes.map((h,i)=>`${h.name||"Hero "+(i+1)}: Level ${h.level} ${h.cls}`).join(", ");
   const prompt=`Create a ${state.legendary?"LEGENDARY ":""}monster for: ${party} (${state.heroes.length} heroes, total levels ${totalLvl()}). Difficulty: ${state.diff}. Theme: ${state.theme.join(", ")||"any"}. Environment: ${state.env.join(", ")||"any"}. ${state.size?"Size: "+state.size+".":""} ${state.legendary?"Use Legendary table at party level "+avgLvl()+".":""} ${state.custom}`;
 
@@ -447,10 +449,15 @@ async function generate(){
     classes: state.heroes.map(h => h.cls)
   };
 
+  // Send either API key or invite code (invite code takes priority)
+  const payload = {system:SYSTEM_PROMPT,prompt:prompt,options:options};
+  if(state.cfg.inviteCode){payload.inviteCode=state.cfg.inviteCode}
+  else{payload.key=state.cfg.anthropicKey}
+
   try{
     const res=await fetch("/api/claude",{
       method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({key:state.cfg.anthropicKey,system:SYSTEM_PROMPT,prompt:prompt,options:options})
+      body:JSON.stringify(payload)
     });
     const data=await res.json();
     if(data.error)throw new Error(data.error);
@@ -490,7 +497,10 @@ function render(){
 
   if(state.showConfig){const c=state.cfg;
     h+=`<div class="config-panel"><span class="gold" style="font-family:Cinzel,serif;font-size:14px;font-weight:bold;letter-spacing:1px">API SETTINGS</span>
-    <div style="margin-top:16px;margin-bottom:12px"><label class="section">Anthropic API Key</label>
+    <div style="margin-top:16px;margin-bottom:12px"><label class="section">Invite Code</label>
+    <input id="cfgInv" value="${esc(c.inviteCode||"")}" placeholder="Enter invite code..."><div class="hint">Have an invite code? Enter it here — no API key needed</div></div>
+    <div class="divider"></div>
+    <div style="margin-bottom:12px;margin-top:12px"><label class="section">Anthropic API Key <span class="dim">(or use invite code above)</span></label>
     <input type="password" id="cfgA" value="${esc(c.anthropicKey)}" placeholder="sk-ant-..."><div class="hint">console.anthropic.com/settings/keys</div></div>
     <div style="margin-bottom:12px"><label class="section">Airtable Token</label>
     <input type="password" id="cfgT" value="${esc(c.atToken)}" placeholder="pat..."><div class="hint">airtable.com/create/tokens — needs data.records:write</div></div>
@@ -498,7 +508,7 @@ function render(){
     <input id="cfgB" value="${esc(c.atBase)}" placeholder="appXXXXXXXXXXXXXX"></div>
     <div style="margin-bottom:16px"><label class="section">Airtable Monsters Table ID</label>
     <input id="cfgTbl" value="${esc(c.atTable)}" placeholder="tblXXXXXXXXXXXXXX"><div class="hint">Both IDs from your URL: airtable.com/appXXX/tblXXX/...</div></div>
-    <div style="display:flex;gap:8px"><button class="btn-save-cfg" onclick="state.cfg={anthropicKey:document.getElementById('cfgA').value,atToken:document.getElementById('cfgT').value,atBase:document.getElementById('cfgB').value,atTable:document.getElementById('cfgTbl').value};saveCfg();state.showConfig=false;render()">Save</button>
+    <div style="display:flex;gap:8px"><button class="btn-save-cfg" onclick="state.cfg={anthropicKey:document.getElementById('cfgA').value,inviteCode:document.getElementById('cfgInv').value,atToken:document.getElementById('cfgT').value,atBase:document.getElementById('cfgB').value,atTable:document.getElementById('cfgTbl').value};saveCfg();state.showConfig=false;render()">Save</button>
     <button class="btn-cancel" onclick="state.showConfig=false;render()">Cancel</button></div></div>`}
 
   h+=`<div class="group"><div style="display:flex;justify-content:space-between;margin-bottom:8px">
@@ -588,6 +598,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         start = time.time()
 
         if self.path == "/metrics":
+            # ── Prometheus metrics endpoint (protected by bearer token) ──
+            if METRICS_BEARER_TOKEN:
+                auth_header = self.headers.get("Authorization", "")
+                expected = f"Bearer {METRICS_BEARER_TOKEN}"
+                if auth_header != expected:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"401 Unauthorized - Bearer token required")
+                    return
             metrics_data = generate_latest()
             self.send_response(200)
             self.send_header("Content-Type", CONTENT_TYPE_LATEST)
@@ -668,6 +688,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _proxy_claude(self, body, start):
         options = body.get("options", {})
+
+        # ── Resolve API key: either user's own key or invite code ──
+        api_key = body.get("key", "")
+        invite_code = body.get("inviteCode", "").strip()
+
+        if invite_code:
+            # Validate invite code
+            with _invite_lock:
+                if invite_code not in _invite_codes:
+                    self._json_response(403, {"error": "Invalid invite code."})
+                    return
+                max_uses = _invite_codes[invite_code]
+                current = _invite_usage.get(invite_code, 0)
+                if current >= max_uses:
+                    self._json_response(403, {"error": f"Invite code '{invite_code}' has reached its usage limit ({max_uses})."})
+                    return
+                _invite_usage[invite_code] = current + 1
+                INVITE_USAGE.labels(code=invite_code).inc()
+
+            if not ANTHROPIC_API_KEY:
+                self._json_response(500, {"error": "Server API key not configured. Contact the admin."})
+                return
+            api_key = ANTHROPIC_API_KEY
+            print(f"  [invite] Code '{invite_code}' used ({_invite_usage[invite_code]}/{_invite_codes[invite_code]})")
+
+        if not api_key:
+            self._json_response(400, {"error": "No API key or invite code provided."})
+            return
+
         try:
             payload = json.dumps({
                 "model": "claude-sonnet-4-20250514",
@@ -680,7 +729,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data=payload,
                 headers={
                     "Content-Type": "application/json",
-                    "x-api-key": body.get("key", ""),
+                    "x-api-key": api_key,
                     "anthropic-version": "2023-06-01"
                 }
             )
@@ -824,9 +873,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 SERVER_START = time.time()
 
 if __name__ == "__main__":
-    push_thread = threading.Thread(target=_push_metrics_loop, daemon=True)
-    push_thread.start()
-
     print(f"""
 ╔══════════════════════════════════════════╗
 ║       ⚔  NIMBLE MONSTER FORGE  ⚔        ║
@@ -839,10 +885,20 @@ if __name__ == "__main__":
 ╚══════════════════════════════════════════╝
 """)
 
-    if GRAFANA_REMOTE_WRITE_URL:
-        print(f"  [metrics] Remote write -> Grafana Cloud (every {PUSH_INTERVAL}s)")
+    if METRICS_BEARER_TOKEN:
+        print("  [metrics] /metrics endpoint protected by bearer token")
+        print("  [metrics] Configure Grafana Cloud Metrics Endpoint integration to scrape it")
     else:
-        print("  [metrics] Local only (set GRAFANA_REMOTE_WRITE_URL for cloud push)")
+        print("  [metrics] /metrics endpoint is open (set METRICS_BEARER_TOKEN to protect it)")
+
+    if _invite_codes:
+        print(f"  [invite] {len(_invite_codes)} invite code(s) active: {', '.join(f'{k}:{v}' for k,v in _invite_codes.items())}")
+        if ANTHROPIC_API_KEY:
+            print("  [invite] Server-side API key configured")
+        else:
+            print("  [invite] WARNING: ANTHROPIC_API_KEY not set — invite codes won't work!")
+    else:
+        print("  [invite] No invite codes configured (set INVITE_CODES env var)")
     print()
 
     server = http.server.HTTPServer(("", PORT), Handler)

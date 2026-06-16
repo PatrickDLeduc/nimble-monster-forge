@@ -731,7 +731,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         try:
             payload = json.dumps({
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 1000,
                 "system": body.get("system", ""),
                 "messages": [{"role": "user", "content": body.get("prompt", "")}]
